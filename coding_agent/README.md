@@ -8,9 +8,15 @@
 - 📖 **read_file** — 读取文件内容，带行号，支持行号范围
 - 📂 **list_directory** — 列出目录内容，标注文件和目录
 - 🔍 **search_in_file** — 在文件中搜索关键词，带上下文
-- ⚙️ **execute_command** — 执行安全的 shell 命令（有安全白名单）
-- 📦 自动上下文压缩（滑动窗口），防止 token 超限
+- ⚙️ **execute_command** — 执行安全的 shell 命令（三级安全分级）
+- ✏️ **write_file** — 创建或修改文件（支持覆盖/追加，路径沙盒保护）
+- ❓ **ask_followup_question** — 不确定时主动向用户澄清
+- 📦 智能上下文压缩（三级策略：轻量 / 中度滑动窗口 / 重度 LLM 摘要）
+- ⚡ 流式输出（实时逐字显示文本响应）
+- 🔄 API 重试（指数退避，最多 3 次）
+- 💾 会话持久化（SQLite，自动存档 + 手动命名保存 / 恢复）
 - 📊 实时显示 token 用量
+- 🛡️ 结构化异常体系（工具错误有明确类型）
 
 ## 环境要求
 
@@ -24,7 +30,7 @@
 cd coding_agent
 
 # 2. 安装依赖
-pip install openai python-dotenv tiktoken
+pip install -r requirements.txt
 
 # 3. 配置环境变量
 cp .env.example .env
@@ -39,113 +45,84 @@ python agent.py
 编辑 `.env` 文件：
 
 ```ini
-# 必填：你的 API Key
+# --- API 配置（必填）---
 API_KEY=sk-your-api-key-here
 
-# 模型名称（默认 deepseek-chat，也可以用 gpt-4o、claude 兼容接口等）
+# 模型名称
 MODEL_NAME=deepseek-chat
 
-# API 地址（DeepSeek 默认地址，换成 OpenAI 就是 https://api.openai.com/v1）
+# API 地址
 BASE_URL=https://api.deepseek.com
 
-# 最大工具调用轮数（一次用户输入最多让 Agent 调用多少次工具）
-MAX_TOOL_ROUNDS=5
+# --- 模型参数 ---
+TEMPERATURE=0.7          # 温度（0-2）
+TOP_P=1.0                # Top-P 采样
 
-# 上下文窗口保留的最近对话轮数
-MAX_RECENT_ROUNDS=10
-```
+# --- 流式输出 ---
+STREAMING_ENABLED=true   # 开启后文本响应实时逐字显示
 
-## 使用示例
+# --- API 重试 ---
+MAX_RETRIES=3            # 最大重试次数
+RETRY_BASE_DELAY=1.0     # 重试基础延迟（秒）
 
-```
-🤖 Coding Agent 启动
-   模型: deepseek-chat
-   地址: https://api.deepseek.com
-   最大工具轮数: 5
-   上下文窗口: 保留最近 10 轮对话
-
-💬 开始对话（输入 /exit 退出，/clear 清空上下文）
-───────────────────────────────────────────────────────
-
-👤 你: 帮我看看当前目录下有什么文件
-
-  🧠 [思考中] 轮次 1...
-  🔧 [调用] list_directory({"dir_path": "."})
-  📋 [结果] 245 字符
-  📊 [用量] 输入 620 token | 输出 45 token | 总计 665 token
-
-  🧠 [思考中] 轮次 2...
-
-🤖 Agent:
-当前目录下有这些文件：
-- agent.py
-- tools.py
-- .env
-- README.md
-
-👤 你: 读一下 tools.py 的前 30 行
-
-  🧠 [思考中] 轮次 1...
-  🔧 [调用] read_file({"file_path": "tools.py", "line_start": 1, "line_end": 30})
-  ...
-
-👤 你: /exit
-👋 再见！
+# --- 会话管理 ---
+MAX_TOOL_ROUNDS=5        # 最大工具调用轮数
+MAX_RECENT_ROUNDS=10     # 上下文窗口保留轮数
+CONTEXT_LIMIT_TOKENS=80000  # 上下文 token 上限
 ```
 
 ## 特殊命令
 
 | 命令 | 作用 |
 |------|------|
-| `/exit` | 退出程序 |
+| `/exit` | 退出程序（自动保存会话） |
 | `/clear` | 清空对话上下文 |
+| `/help` | 显示帮助信息 |
+| `/stats` | 查看当前会话统计 |
+| `/save <名称>` | 保存当前会话为命名存档 |
+| `/load <名称>` | 加载命名存档 |
+| `/sessions` | 列出所有已保存的会话 |
 
 ## 安全说明
 
-`execute_command` 工具实现了两层安全机制：
+`execute_command` 工具实现了三级安全机制：
 
-1. **命令白名单**：只允许 `ls`、`cat`、`grep`、`find`、`git`、`python`、`pytest` 等开发常用命令
-2. **危险模式检测**：禁止包含 `rm`、`sudo`、`chmod 777`、fork bomb、管道到 shell 等危险操作
+1. **安全命令**（直接执行）：`ls`、`cat`、`grep`、`find`、`git`、`python`、`pytest` 等
+2. **需确认命令**（询问用户后执行）：`pip install`、`npm install`、`curl`、`mv`、`cp` 等
+3. **禁止命令**（直接拒绝）：`rm`、`sudo`、`chmod 777`、fork bomb、管道到 shell 等
 
-白名单以外的命令会被拒绝执行。
+此外，简单命令优先使用 `shell=False` 执行以增强安全性。
+
+## 项目结构
+
+```
+coding_agent/
+├── .env.example        # 环境变量模板
+├── .env                # 你的私有配置（不提交到 git）
+├── agent.py            # 主入口，Agent 核心循环
+├── tools.py            # 工具函数 + 工具注册 + JSON Schema
+├── exceptions.py       # 异常体系定义
+├── session_store.py    # 会话持久化（SQLite）
+├── requirements.txt    # 依赖声明
+├── pyproject.toml      # 项目元数据
+└── README.md           # 本文件
+```
 
 ## 扩展指南
 
 要新增一个工具，只需在 `tools.py` 中做三件事：
 
 ```python
-# ① 写函数
+# ① 写函数（错误用异常抛出）
 def my_tool(param1: str) -> str:
     """工具描述"""
+    if not param1:
+        raise ToolInputError("param1 is required", tool_name="my_tool")
     return f"结果: {param1}"
 
 # ② 注册映射
 AVAILABLE_TOOLS["my_tool"] = my_tool
 
 # ③ 添加 JSON Schema
-TOOLS.append({
-    "type": "function",
-    "function": {
-        "name": "my_tool",
-        "description": "...",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "param1": {"type": "string", "description": "..."}
-            },
-            "required": ["param1"],
-        },
-    },
-})
-```
-
-## 项目结构
-
-```
-coding_agent/
-├── .env.example   # 环境变量模板
-├── .env           # 你的私有配置（不提交到 git）
-├── agent.py       # 主入口，Agent 核心循环
-├── tools.py       # 工具函数 + 工具注册 + JSON Schema
-└── README.md      # 本文件
+TOOLS.append({...})
 ```

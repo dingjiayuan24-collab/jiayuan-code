@@ -7,9 +7,15 @@ tools.py —— Coding Agent 的工具系统
   1. 在下方写一个函数（func）
   2. 在 AVAILABLE_TOOLS 字典里注册映射
   3. 在 TOOLS 列表里添加 JSON Schema 定义
+
+v2 变更：
+  - 工具函数改用异常代替字符串错误（ToolInputError / ToolExecutionError / ToolSecurityError）
+  - execute_command 安全分类逻辑不变，但 blocked 现在抛出 ToolSecurityError
 """
 
 import os
+import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -20,12 +26,18 @@ from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
+from exceptions import (
+    ToolError,
+    ToolInputError,
+    ToolExecutionError,
+    ToolSecurityError,
+)
+
 # 全局 Rich Console 实例，供所有工具函数使用
 console = Console()
 
 # ============================================================
 # 工作区根目录 —— 由 agent.py 在启动时设置
-# 用于 write_file 的路径安全检查
 # ============================================================
 
 _workspace_root: str = os.getcwd()
@@ -64,12 +76,9 @@ def is_safe_path(file_path: str, workspace_root: str | None = None) -> tuple[boo
     root = workspace_root or _workspace_root
 
     try:
-        # resolve() 会把相对路径转为绝对路径，并解析 .. 和符号链接
         resolved = Path(file_path).resolve()
         root_resolved = Path(root).resolve()
 
-        # 检查 resolved 是否在 root_resolved 之下
-        # 使用 Path.is_relative_to（Python 3.9+）
         try:
             resolved.relative_to(root_resolved)
             return True, ""
@@ -118,32 +127,38 @@ def read_file(file_path: str, line_start: int | None = None, line_end: int | Non
 
     返回:
         带行号的文本内容，格式同 cat -n 命令
+
+    异常:
+        ToolInputError:     参数不合法
+        ToolExecutionError: 文件不存在、无法读取等
     """
     if not file_path or not file_path.strip():
-        return "错误：file_path 不能为空"
+        raise ToolInputError("file_path 不能为空", tool_name="read_file")
 
     path = Path(file_path)
 
     if not path.exists():
-        return f"错误：文件不存在 —— {file_path}"
-
+        raise ToolExecutionError(f"文件不存在 —— {file_path}", tool_name="read_file")
     if not path.is_file():
-        return f"错误：路径是一个目录，不是文件 —— {file_path}"
+        raise ToolExecutionError(f"路径是一个目录，不是文件 —— {file_path}", tool_name="read_file")
 
-    # --- 尝试读取文件 ---
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.readlines()
     except PermissionError:
-        return f"错误：没有权限读取文件 —— {file_path}"
+        raise ToolExecutionError(f"没有权限读取文件 —— {file_path}", tool_name="read_file")
     except UnicodeDecodeError:
         try:
             with open(path, "r", encoding="latin-1") as f:
                 lines = f.readlines()
         except Exception as e:
-            return f"错误：文件编码无法识别 —— {file_path}，详情: {e}"
+            raise ToolExecutionError(
+                f"文件编码无法识别 —— {file_path}，详情: {e}", tool_name="read_file"
+            )
     except Exception as e:
-        return f"错误：读取文件时发生异常 —— {file_path}，详情: {e}"
+        raise ToolExecutionError(
+            f"读取文件时发生异常 —— {file_path}，详情: {e}", tool_name="read_file"
+        )
 
     total_lines = len(lines)
     start = line_start if line_start is not None else 1
@@ -153,7 +168,9 @@ def read_file(file_path: str, line_start: int | None = None, line_end: int | Non
     end = min(total_lines, end)
 
     if start > end:
-        return f"错误：line_start ({line_start}) 大于 line_end ({line_end})"
+        raise ToolInputError(
+            f"line_start ({line_start}) 大于 line_end ({line_end})", tool_name="read_file"
+        )
 
     result_parts = []
     for i in range(start - 1, end):
@@ -170,23 +187,31 @@ def read_file(file_path: str, line_start: int | None = None, line_end: int | Non
 def list_directory(dir_path: str) -> str:
     """
     列出指定目录下的所有文件和子目录，标注类型和文件大小。
+
+    异常:
+        ToolInputError:     参数为空
+        ToolExecutionError: 目录不存在或无法访问
     """
     if not dir_path or not dir_path.strip():
-        return "错误：dir_path 不能为空"
+        raise ToolInputError("dir_path 不能为空", tool_name="list_directory")
 
     path = Path(dir_path)
 
     if not path.exists():
-        return f"错误：目录不存在 —— {dir_path}"
+        raise ToolExecutionError(f"目录不存在 —— {dir_path}", tool_name="list_directory")
     if not path.is_dir():
-        return f"错误：路径不是目录 —— {dir_path}"
+        raise ToolExecutionError(f"路径不是目录 —— {dir_path}", tool_name="list_directory")
 
     try:
         entries = sorted(path.iterdir())
     except PermissionError:
-        return f"错误：没有权限访问目录 —— {dir_path}"
+        raise ToolExecutionError(
+            f"没有权限访问目录 —— {dir_path}", tool_name="list_directory"
+        )
     except Exception as e:
-        return f"错误：读取目录时发生异常 —— {dir_path}，详情: {e}"
+        raise ToolExecutionError(
+            f"读取目录时发生异常 —— {dir_path}，详情: {e}", tool_name="list_directory"
+        )
 
     if not entries:
         return f"目录为空 —— {dir_path}"
@@ -214,32 +239,40 @@ def list_directory(dir_path: str) -> str:
 def search_in_file(file_path: str, query: str) -> str:
     """
     在文件中搜索包含 query 的行，返回匹配行及其上下文（前后各 2 行）。
+
+    异常:
+        ToolInputError:     参数为空
+        ToolExecutionError: 文件不存在或无法读取
     """
     if not file_path or not file_path.strip():
-        return "错误：file_path 不能为空"
+        raise ToolInputError("file_path 不能为空", tool_name="search_in_file")
     if not query or not query.strip():
-        return "错误：query 不能为空"
+        raise ToolInputError("query 不能为空", tool_name="search_in_file")
 
     path = Path(file_path)
 
     if not path.exists():
-        return f"错误：文件不存在 —— {file_path}"
+        raise ToolExecutionError(f"文件不存在 —— {file_path}", tool_name="search_in_file")
     if not path.is_file():
-        return f"错误：路径不是文件 —— {file_path}"
+        raise ToolExecutionError(f"路径不是文件 —— {file_path}", tool_name="search_in_file")
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.readlines()
     except PermissionError:
-        return f"错误：没有权限读取文件 —— {file_path}"
+        raise ToolExecutionError(f"没有权限读取文件 —— {file_path}", tool_name="search_in_file")
     except UnicodeDecodeError:
         try:
             with open(path, "r", encoding="latin-1") as f:
                 lines = f.readlines()
         except Exception as e:
-            return f"错误：文件编码无法识别 —— {file_path}，详情: {e}"
+            raise ToolExecutionError(
+                f"文件编码无法识别 —— {file_path}，详情: {e}", tool_name="search_in_file"
+            )
     except Exception as e:
-        return f"错误：读取文件时发生异常 —— {file_path}，详情: {e}"
+        raise ToolExecutionError(
+            f"读取文件时发生异常 —— {file_path}，详情: {e}", tool_name="search_in_file"
+        )
 
     total_lines = len(lines)
     matched_indices = []
@@ -294,40 +327,40 @@ SAFE_COMMANDS = {
 
 # --- 第二级：需确认命令（打印警告，等用户输入 y/n 后才执行）---
 NEED_CONFIRM_COMMANDS = {
-    "pip", "pip3",         # 包安装
-    "npm",                 # npm install 属于需确认
-    "yarn", "pnpm",        # 包管理
-    "cargo",               # cargo build/install 需确认
-    "rustc", "go",         # 编译器
-    "make", "cmake",       # 构建工具
-    "mv", "cp",            # 文件移动/复制
-    "mkdir", "touch",      # 文件创建
-    "chmod",               # 权限修改（非 777 的情况）
-    "curl", "wget",        # 网络下载
-    "sed", "awk",          # 文本处理（可能修改文件）
-    "xargs",               # 批量执行
+    "pip", "pip3",
+    "npm",
+    "yarn", "pnpm",
+    "cargo",
+    "rustc", "go",
+    "make", "cmake",
+    "mv", "cp",
+    "mkdir", "touch",
+    "chmod",
+    "curl", "wget",
+    "sed", "awk",
+    "xargs",
 }
 
-# --- 第三级：禁止命令（直接拒绝，不执行）---
+# --- 第三级：禁止命令（直接拒绝，抛出异常）---
 BLOCKED_PATTERNS = [
-    "rm ", "rmdir",                  # 删除
-    "sudo", "su ",                    # 提权
-    "chmod 777", "chmod -R 777",     # 危险权限
-    "chmod u+s", "chmod g+s",        # setuid/setgid
-    "chown",                          # 修改所有者
-    "mkfs", "mkswap", "dd ",         # 格式化/覆写磁盘
-    ":(){ :|:& };:",                  # fork bomb
-    "> /dev/", "> /etc/", "> /proc/",  # 覆写系统文件
-    "| sh", "| bash", "| zsh",       # 管道到 shell（绕过命令检测）
-    "reboot", "shutdown", "halt",    # 关机/重启
-    "kill", "killall", "pkill",      # 杀进程
-    "iptables", "nft ",              # 防火墙修改
-    "passwd",                        # 修改密码
-    "mount", "umount",               # 挂载操作
-    "mkfs.",                         # 格式化变体
-    "docker rm", "docker rmi",       # 删除 docker 资源
-    "chattr",                        # 文件属性修改
-    "curl " "| sh", "wget " "| sh",  # 下载并执行
+    "rm ", "rmdir",
+    "sudo", "su ",
+    "chmod 777", "chmod -R 777",
+    "chmod u+s", "chmod g+s",
+    "chown",
+    "mkfs", "mkswap", "dd ",
+    ":(){ :|:& };:",
+    "> /dev/", "> /etc/", "> /proc/",
+    "| sh", "| bash", "| zsh",
+    "reboot", "shutdown", "halt",
+    "kill", "killall", "pkill",
+    "iptables", "nft ",
+    "passwd",
+    "mount", "umount",
+    "mkfs.",
+    "docker rm", "docker rmi",
+    "chattr",
+    "curl " "| sh", "wget " "| sh",
 ]
 
 
@@ -348,22 +381,26 @@ def _classify_command(base_cmd: str, full_command: str) -> str:
 
     # 再检查是否需要确认
     if base_cmd in NEED_CONFIRM_COMMANDS:
-        # npm、cargo 等命令需要看具体子命令
-        # npm install / pip install 等是安装操作，需要确认
-        # npm run / npm test 等是安全操作，不需要确认
         if base_cmd in ("npm", "yarn", "pnpm"):
             parts = normalized.strip().split()
-            if len(parts) >= 2 and parts[1] in ("run", "test", "lint", "fmt", "check", "list", "ls", "view", "outdated", "audit", "why", "doctor", "help"):
+            if len(parts) >= 2 and parts[1] in (
+                "run", "test", "lint", "fmt", "check", "list", "ls",
+                "view", "outdated", "audit", "why", "doctor", "help",
+            ):
                 return "safe"
-            return "need_confirm"  # npm install / npm add 等默认需确认
+            return "need_confirm"
         if base_cmd == "cargo":
             parts = normalized.strip().split()
-            if len(parts) >= 2 and parts[1] in ("check", "test", "fmt", "clippy", "doc", "help", "version"):
+            if len(parts) >= 2 and parts[1] in (
+                "check", "test", "fmt", "clippy", "doc", "help", "version",
+            ):
                 return "safe"
             return "need_confirm"
         if base_cmd in ("pip", "pip3"):
             parts = normalized.strip().split()
-            if len(parts) >= 2 and parts[1] in ("list", "show", "freeze", "check", "config", "help", "--version"):
+            if len(parts) >= 2 and parts[1] in (
+                "list", "show", "freeze", "check", "config", "help", "--version",
+            ):
                 return "safe"
             return "need_confirm"
         if base_cmd in ("curl", "wget"):
@@ -380,27 +417,70 @@ def _classify_command(base_cmd: str, full_command: str) -> str:
     return "blocked"
 
 
+# 需确认命令的交互回复缓存（避免同一轮重复提问）
+_user_confirm_cache: dict[str, bool] = {}
+
+
+def _ask_user_to_confirm(command: str) -> bool:
+    """
+    询问用户是否允许执行某条需确认的命令。
+    同一轮对话中相同的命令不会重复询问。
+    """
+    # 缓存键：命令的前 120 个字符
+    cache_key = command.strip()[:120]
+    if cache_key in _user_confirm_cache:
+        return _user_confirm_cache[cache_key]
+
+    warning_text = Text()
+    warning_text.append("⚠️  需要确认\n", style="bold yellow")
+    warning_text.append(f"命令: ", style="dim")
+    warning_text.append(f"{command}", style="bold white")
+    warning_text.append(f"\n分类: 该命令被归类为需确认操作", style="dim")
+
+    console.print()
+    console.print(Panel(warning_text, border_style="yellow", title="安全确认"))
+
+    answer = Prompt.ask(
+        "  [bold yellow]是否执行？[/bold yellow]",
+        choices=["y", "n"],
+        default="n",
+    )
+
+    allowed = answer.lower() == "y"
+    _user_confirm_cache[cache_key] = allowed
+    return allowed
+
+
+def clear_confirm_cache() -> None:
+    """清空需确认命令缓存（每轮对话开始时调用）。"""
+    _user_confirm_cache.clear()
+
+
 def execute_command(command: str) -> str:
     """
     在三级安全分类下执行 shell 命令。
 
     1. 安全命令：直接执行
     2. 需确认命令：显示警告，等待用户输入 y/n
-    3. 禁止命令：直接拒绝
+    3. 禁止命令：抛出 ToolSecurityError
 
     参数:
         command: 要执行的 shell 命令字符串
 
     返回:
         命令的执行结果（stdout + stderr）
+
+    异常:
+        ToolInputError:     命令为空
+        ToolSecurityError:  命令被安全限制阻止
+        ToolExecutionError: 命令执行失败
     """
     if not command or not command.strip():
-        return "错误：command 不能为空"
+        raise ToolInputError("command 不能为空", tool_name="execute_command")
 
-    # --- 提取命令名 ---
     cmd_parts = command.strip().split()
     if not cmd_parts:
-        return "错误：无法解析命令"
+        raise ToolInputError("无法解析命令", tool_name="execute_command")
 
     base_cmd = cmd_parts[0]
     if "/" in base_cmd:
@@ -410,43 +490,49 @@ def execute_command(command: str) -> str:
     classification = _classify_command(base_cmd, command)
 
     if classification == "blocked":
-        return (
-            f"⛔ 安全限制：命令 \"{base_cmd}\" 包含危险操作，已被阻止执行。\n"
-            f"如果你确实需要执行此操作，请在终端中手动执行。"
+        raise ToolSecurityError(
+            f"命令 \"{base_cmd}\" 包含危险操作，已被阻止执行。\n"
+            f"如果你确实需要执行此操作，请在终端中手动执行。",
+            tool_name="execute_command",
         )
 
     if classification == "need_confirm":
-        # 用 rich 显示警告面板
-        warning_text = Text()
-        warning_text.append("⚠️  需要确认\n", style="bold yellow")
-        warning_text.append(f"命令: ", style="dim")
-        warning_text.append(f"{command}", style="bold white")
-        warning_text.append(f"\n分类: 该命令被归类为需确认操作", style="dim")
-
-        console.print()
-        console.print(Panel(warning_text, border_style="yellow", title="安全确认"))
-
-        # 等待用户输入
-        answer = Prompt.ask(
-            "  [bold yellow]是否执行？[/bold yellow]",
-            choices=["y", "n"],
-            default="n",
-        )
-        if answer.lower() != "y":
+        allowed = _ask_user_to_confirm(command)
+        if not allowed:
             return f"⏭️ 用户取消了命令执行: {command}"
-
         console.print("  [dim]用户确认，继续执行...[/dim]")
 
-    # --- 执行命令 ---
+    # --- 执行命令（优先使用 shell=False 以增强安全性）---
+    # 检测 shell 元字符：如果命令包含 | > < && || ; $() `` 等则必须用 shell=True
+    SHELL_META_PATTERN = re.compile(r'[|&;><$`!]|\|\||&&')
+
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=os.getcwd(),
-        )
+        if SHELL_META_PATTERN.search(command):
+            # 包含 shell 元字符，使用 shell=True（经过安全分级检查）
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=os.getcwd(),
+            )
+        else:
+            # 简单命令：用 shlex 安全分割后用 shell=False 执行
+            try:
+                cmd_list = shlex.split(command)
+            except ValueError as e:
+                raise ToolInputError(
+                    f"命令解析失败 —— {e}", tool_name="execute_command"
+                )
+            result = subprocess.run(
+                cmd_list,
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=os.getcwd(),
+            )
 
         output_parts = []
         if result.stdout:
@@ -460,15 +546,21 @@ def execute_command(command: str) -> str:
         return "\n".join(output_parts)
 
     except subprocess.TimeoutExpired:
-        return f"错误：命令执行超时（30 秒）—— {command}"
+        raise ToolExecutionError(
+            f"命令执行超时（30 秒）—— {command}", tool_name="execute_command"
+        )
     except FileNotFoundError:
-        return f"错误：命令未找到 —— {base_cmd}"
+        raise ToolExecutionError(f"命令未找到 —— {base_cmd}", tool_name="execute_command")
+    except ToolInputError:
+        raise
     except Exception as e:
-        return f"错误：执行命令时发生异常 —— {command}，详情: {e}"
+        raise ToolExecutionError(
+            f"执行命令时发生异常 —— {command}，详情: {e}", tool_name="execute_command"
+        )
 
 
 # ============================================================
-# 5. write_file —— 写入文件内容（新增！）
+# 5. write_file —— 写入文件内容
 # ============================================================
 
 def write_file(file_path: str, content: str, mode: str = "overwrite") -> str:
@@ -489,26 +581,34 @@ def write_file(file_path: str, content: str, mode: str = "overwrite") -> str:
 
     返回:
         操作结果描述
-    """
-    # --- 参数校验 ---
-    if not file_path or not file_path.strip():
-        return "错误：file_path 不能为空"
-    if content is None:
-        return "错误：content 不能为 None"
 
+    异常:
+        ToolInputError:     参数不合法
+        ToolSecurityError:  路径不在工作区内
+        ToolExecutionError: 写入失败
+    """
+    if not file_path or not file_path.strip():
+        raise ToolInputError("file_path 不能为空", tool_name="write_file")
+    if content is None:
+        raise ToolInputError("content 不能为 None", tool_name="write_file")
     if mode not in ("overwrite", "append"):
-        return f"错误：不支持的 mode '{mode}'，只支持 'overwrite' 和 'append'"
+        raise ToolInputError(
+            f"不支持的 mode '{mode}'，只支持 'overwrite' 和 'append'",
+            tool_name="write_file",
+        )
 
     # --- 安全检查：路径必须在工作区内 ---
     safe, reason = is_safe_path(file_path)
     if not safe:
-        return f"⛔ {reason}"
+        raise ToolSecurityError(reason, tool_name="write_file")
 
     path = Path(file_path)
 
     # --- 检查不是目录 ---
     if path.exists() and path.is_dir():
-        return f"错误：'{file_path}' 是一个目录，不能作为文件写入"
+        raise ToolExecutionError(
+            f"'{file_path}' 是一个目录，不能作为文件写入", tool_name="write_file"
+        )
 
     # --- 备份逻辑（仅 overwrite 模式且文件存在时）---
     backup_info = ""
@@ -529,9 +629,13 @@ def write_file(file_path: str, content: str, mode: str = "overwrite") -> str:
         try:
             parent.mkdir(parents=True, exist_ok=True)
         except PermissionError:
-            return f"错误：没有权限创建目录 —— {parent}"
+            raise ToolExecutionError(
+                f"没有权限创建目录 —— {parent}", tool_name="write_file"
+            )
         except Exception as e:
-            return f"错误：创建父目录失败 —— {parent}，详情: {e}"
+            raise ToolExecutionError(
+                f"创建父目录失败 —— {parent}，详情: {e}", tool_name="write_file"
+            )
 
     # --- 执行写入 ---
     try:
@@ -544,12 +648,17 @@ def write_file(file_path: str, content: str, mode: str = "overwrite") -> str:
                 f.write(content)
             action = "写入"
     except PermissionError:
-        return f"错误：没有权限写入文件 —— {file_path}"
+        raise ToolExecutionError(
+            f"没有权限写入文件 —— {file_path}", tool_name="write_file"
+        )
     except OSError as e:
-        # 磁盘满等系统错误
-        return f"错误：写入文件时发生系统错误 —— {file_path}，详情: {e}"
+        raise ToolExecutionError(
+            f"写入文件时发生系统错误 —— {file_path}，详情: {e}", tool_name="write_file"
+        )
     except Exception as e:
-        return f"错误：写入文件时发生异常 —— {file_path}，详情: {e}"
+        raise ToolExecutionError(
+            f"写入文件时发生异常 —— {file_path}，详情: {e}", tool_name="write_file"
+        )
 
     # --- 返回结果 ---
     file_info = get_file_info(file_path)
@@ -569,7 +678,7 @@ def write_file(file_path: str, content: str, mode: str = "overwrite") -> str:
 
 
 # ============================================================
-# 6. ask_followup_question —— 向用户澄清问题（新增！）
+# 6. ask_followup_question —— 向用户澄清问题
 # ============================================================
 
 def ask_followup_question(question: str, options: list[str] | None = None) -> str:
@@ -582,11 +691,13 @@ def ask_followup_question(question: str, options: list[str] | None = None) -> st
 
     返回:
         用户的回答字符串
+
+    异常:
+        ToolInputError: question 为空
     """
     if not question or not question.strip():
-        return "错误：question 不能为空"
+        raise ToolInputError("question 不能为空", tool_name="ask_followup_question")
 
-    # 用 rich 显示问题面板
     question_text = Text()
     question_text.append("❓ ", style="bold cyan")
     question_text.append(question, style="white")
@@ -595,11 +706,8 @@ def ask_followup_question(question: str, options: list[str] | None = None) -> st
     console.print(Panel(question_text, border_style="cyan", title="Agent 需要确认"))
 
     if options and len(options) > 0:
-        # --- 带选项的提问 ---
-        # 限制最多 5 个选项
         display_options = options[:5]
 
-        # 构建 rich Table 展示选项
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column("key", style="bold cyan", width=4)
         table.add_column("value", style="white")
@@ -609,7 +717,6 @@ def ask_followup_question(question: str, options: list[str] | None = None) -> st
 
         console.print(table)
 
-        # 获取用户选择
         valid_choices = [str(i) for i in range(len(display_options) + 1)]
         choice = Prompt.ask(
             "  [bold cyan]请选择[/bold cyan]",
@@ -619,13 +726,10 @@ def ask_followup_question(question: str, options: list[str] | None = None) -> st
 
         idx = int(choice)
         if idx == 0:
-            # 用户选择自定义输入
             answer = Prompt.ask("  [bold cyan]请输入[/bold cyan]")
         else:
             answer = display_options[idx - 1]
-
     else:
-        # --- 开放式提问 ---
         answer = Prompt.ask(f"  [bold cyan]请回答[/bold cyan]")
 
     console.print(f"  [dim]用户回答: {answer}[/dim]")

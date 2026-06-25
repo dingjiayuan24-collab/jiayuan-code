@@ -1,0 +1,4 @@
+openai>=1.0.0,<2.0.0
+python-dotenv>=1.0.0
+rich>=13.0.0
+tiktoken>=0.5.0  # 可选：用于精确 token 估算，未安装时自动降级为粗略估算
